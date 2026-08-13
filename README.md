@@ -73,8 +73,8 @@ are sufficient to compile the project.
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/macos-compositor-fix.git
-cd macos-compositor-fix
+git clone https://github.com/seakrebel/macos-animation-fix.git
+cd macos-animation-fix
 ```
 
 ### 2. Compile and run
