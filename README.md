@@ -58,6 +58,77 @@ be sufficient**. The application does not need to consume the captured frames.
 This suggests that the effect is related to a system-level display/compositor
 state rather than simply increased GPU utilization.
 
+## Building
+
+### Requirements
+
+- macOS 26 or later
+- Apple Silicon Mac
+- Xcode Command Line Tools
+- Screen Recording permission
+
+You do **not** need the full Xcode application. The Xcode Command Line Tools
+are sufficient to compile the project.
+
+### 1. Clone the repository
+
+```bash
+git clone https://github.com/YOUR_USERNAME/macos-compositor-fix.git
+cd macos-compositor-fix
+```
+
+### 2. Compile and run
+
+```bash
+swiftc main.swift \
+    -o CompositorFix \
+    -framework AppKit \
+    -framework ScreenCaptureKit \
+    -framework CoreMedia
+
+mkdir -p CompositorFix.app/Contents/MacOS
+
+mv CompositorFix \
+    CompositorFix.app/Contents/MacOS/CompositorFix
+
+cat > CompositorFix.app/Contents/Info.plist <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC
+ "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>CompositorFix</string>
+
+    <key>CFBundleIdentifier</key>
+    <string>local.CompositorFix</string>
+
+    <key>CFBundleName</key>
+    <string>CompositorFix</string>
+
+    <key>CFBundleDisplayName</key>
+    <string>CompositorFix</string>
+
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+
+    <key>CFBundleVersion</key>
+    <string>1</string>
+
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+
+    <key>LSUIElement</key>
+    <true/>
+</dict>
+</plist>
+EOF
+
+open CompositorFix.app
+```
+
 ## Important disclaimer
 
 This is an experimental workaround.
