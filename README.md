@@ -172,6 +172,49 @@ Note: replacing the binary can reset the Screen Recording grant.  If the log
 shows a permission error, re-grant it in System Settings → Privacy & Security
 → Screen Recording, then relaunch.
 
+## Security
+
+There are no known security vulnerabilities in this codebase.  The attack
+surface is deliberately minimal and the entire implementation is auditable.
+
+**The app never sees your screen content.**  The `SCStream` is created
+without an `SCStreamOutput`, so captured frames are never delivered to the
+process — they are not buffered, encoded, logged, or stored anywhere.  The
+app's only effect is keeping the capture *session* active.
+
+**No other sensitive access:**
+
+- no network access (no sockets, HTTP, or IPC),
+- no file or disk writes,
+- no user input or untrusted data is ever parsed,
+- no shell or process spawning,
+- no persistent storage (`UserDefaults`, keychain, or config files),
+- no accessibility or keyboard APIs,
+- no dependencies — a single Swift file using only Apple frameworks.
+
+**Capture scope is minimal:**
+
+- one display (`displays.first`), on-screen windows only,
+- 64 × 36 at 1 FPS,
+- no audio (`capturesAudio = false`),
+- no cursor (`showsCursor = false`).
+
+**Transparency:**
+
+- The whole implementation is the single `main.swift` file in this
+  repository.  Build it from source and audit it yourself; do not run
+  prebuilt binaries from untrusted sources.
+- While the stream is active, macOS shows its own screen-recording
+  indicator in the menu bar, independently of this app.
+
+**What you should understand:** the app holds Screen Recording permission,
+which is inherent to its purpose — macOS treats starting a `SCStream` as
+screen recording.  As with any recording app, a modified build would have
+access to the screen, and the binary itself is ad-hoc signed and not
+sandboxed.  For the code in this repository that is irrelevant (it does
+nothing but start a capture session), but it is why you should always build
+and run the app from the published source.
+
 ## Important disclaimer
 
 This is an experimental workaround.
