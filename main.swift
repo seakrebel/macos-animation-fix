@@ -82,7 +82,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SCStreamDelegate {
 
     @objc private func environmentChanged(_ notification: Notification) {
         print(
-            "CompositorFix: environment changed: " +
+            "AnimationFix: environment changed: " +
             notification.name.rawValue
         )
         scheduleRestart()
@@ -119,7 +119,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SCStreamDelegate {
             enabled = false
             updateMenu()
 
-            print("CompositorFix: discarding old stream before restart")
+            print("AnimationFix: discarding old stream before restart")
             stream.stopCapture { _ in }
         }
 
@@ -144,13 +144,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SCStreamDelegate {
 
         if let button = statusItem.button {
             button.title = "◉"
-            button.toolTip = "CompositorFix"
+            button.toolTip = "AnimationFix"
         }
 
         let menu = NSMenu()
 
         let titleItem = NSMenuItem(
-            title: "CompositorFix",
+            title: "AnimationFix",
             action: nil,
             keyEquivalent: ""
         )
@@ -232,7 +232,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SCStreamDelegate {
         startToken += 1
         let token = startToken
 
-        print("CompositorFix: starting capture...")
+        print("AnimationFix: starting capture...")
 
         SCShareableContent.getExcludingDesktopWindows(
             false,
@@ -264,7 +264,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SCStreamDelegate {
                 }
 
                 print(
-                    "CompositorFix: using display \(display.displayID)"
+                    "AnimationFix: using display \(display.displayID)"
                 )
 
                 let filter = SCContentFilter(
@@ -302,7 +302,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SCStreamDelegate {
 
                         if let error {
                             print(
-                                "CompositorFix: ERROR starting capture:"
+                                "AnimationFix: ERROR starting capture:"
                             )
                             print(error)
 
@@ -318,7 +318,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SCStreamDelegate {
                         self.updateMenu()
 
                         print(
-                            "CompositorFix: capture ACTIVE"
+                            "AnimationFix: capture ACTIVE"
                         )
                     }
                 }
@@ -327,7 +327,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SCStreamDelegate {
     }
 
     private func handleStartFailure(_ message: String, _ error: Error?) {
-        print("CompositorFix: \(message)")
+        print("AnimationFix: \(message)")
         if let error {
             print(error)
         }
@@ -337,7 +337,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SCStreamDelegate {
         // wait for the next system event to try again.
         guard retryCount < 5 else {
             print(
-                "CompositorFix: giving up after repeated failures"
+                "AnimationFix: giving up after repeated failures"
             )
             enabled = false
             updateMenu()
@@ -347,7 +347,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SCStreamDelegate {
         retryCount += 1
         let delay = Double(retryCount) * 2.0
         print(
-            "CompositorFix: retrying in \(delay)s " +
+            "AnimationFix: retrying in \(delay)s " +
             "(attempt \(retryCount)/5)"
         )
 
@@ -372,7 +372,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SCStreamDelegate {
             return
         }
 
-        print("CompositorFix: stopping capture...")
+        print("AnimationFix: stopping capture...")
 
         stream.stopCapture { [weak self] error in
             DispatchQueue.main.async {
@@ -382,7 +382,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SCStreamDelegate {
 
                 if let error {
                     print(
-                        "CompositorFix: error stopping capture:"
+                        "AnimationFix: error stopping capture:"
                     )
                     print(error)
                 }
@@ -394,7 +394,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SCStreamDelegate {
                 self.updateMenu()
 
                 print(
-                    "CompositorFix: capture STOPPED"
+                    "AnimationFix: capture STOPPED"
                 )
             }
         }
@@ -403,7 +403,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SCStreamDelegate {
     // MARK: - SCStreamDelegate
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        print("CompositorFix: stream stopped unexpectedly:")
+        print("AnimationFix: stream stopped unexpectedly:")
         print(error)
 
         DispatchQueue.main.async { [weak self] in
@@ -424,7 +424,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SCStreamDelegate {
             self.enabled = false
             self.updateMenu()
 
-            print("CompositorFix: scheduling restart")
+            print("AnimationFix: scheduling restart")
             self.scheduleRestart()
         }
     }

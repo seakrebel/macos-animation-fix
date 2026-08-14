@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-APP_NAME="CompositorFix"
+APP_NAME="AnimationFix"
 
 usage() {
     echo "Usage: $0 [run|install]"
@@ -32,16 +32,16 @@ build() {
 <plist version="1.0">
 <dict>
     <key>CFBundleExecutable</key>
-    <string>CompositorFix</string>
+    <string>AnimationFix</string>
 
     <key>CFBundleIdentifier</key>
-    <string>local.CompositorFix</string>
+    <string>local.AnimationFix</string>
 
     <key>CFBundleName</key>
-    <string>CompositorFix</string>
+    <string>AnimationFix</string>
 
     <key>CFBundleDisplayName</key>
-    <string>CompositorFix</string>
+    <string>AnimationFix</string>
 
     <key>CFBundlePackageType</key>
     <string>APPL</string>
