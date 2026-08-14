@@ -80,7 +80,7 @@ cd macos-animation-fix
 ### 2. Build and run
 
 The build is a single command — the `build.sh` script compiles `main.swift`,
-assembles `CompositorFix.app` and writes its `Info.plist`:
+assembles `AnimationFix.app` and writes its `Info.plist`:
 
 ```bash
 ./build.sh
@@ -107,7 +107,7 @@ environment changes:
 - displays are connected or disconnected (e.g. a docking station),
 - a display wakes from display sleep.
 
-CompositorFix now watches for these events and automatically recreates the
+AnimationFix now watches for these events and automatically recreates the
 capture session:
 
 - `NSWorkspace.didWakeNotification` / `screensDidWakeNotification` (sleep/wake)
