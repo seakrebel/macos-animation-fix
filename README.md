@@ -77,57 +77,25 @@ git clone https://github.com/seakrebel/macos-animation-fix.git
 cd macos-animation-fix
 ```
 
-### 2. Compile and run
+### 2. Build and run
+
+The build is a single command — the `build.sh` script compiles `main.swift`,
+assembles `CompositorFix.app` and writes its `Info.plist`:
 
 ```bash
-swiftc main.swift \
-    -o CompositorFix \
-    -framework AppKit \
-    -framework ScreenCaptureKit \
-    -framework CoreMedia
-
-mkdir -p CompositorFix.app/Contents/MacOS
-
-mv CompositorFix \
-    CompositorFix.app/Contents/MacOS/CompositorFix
-
-cat > CompositorFix.app/Contents/Info.plist <<'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC
- "-//Apple//DTD PLIST 1.0//EN"
- "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-
-<plist version="1.0">
-<dict>
-    <key>CFBundleExecutable</key>
-    <string>CompositorFix</string>
-
-    <key>CFBundleIdentifier</key>
-    <string>local.CompositorFix</string>
-
-    <key>CFBundleName</key>
-    <string>CompositorFix</string>
-
-    <key>CFBundleDisplayName</key>
-    <string>CompositorFix</string>
-
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-
-    <key>CFBundleVersion</key>
-    <string>1</string>
-
-    <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
-
-    <key>LSUIElement</key>
-    <true/>
-</dict>
-</plist>
-EOF
-
-open CompositorFix.app
+./build.sh
 ```
+
+Useful variants:
+
+```bash
+./build.sh run       # build and run from the terminal (shows the app's log)
+./build.sh install   # build, install to /Applications, and launch it
+```
+
+The script is a thin wrapper around `swiftc` (against AppKit,
+ScreenCaptureKit and CoreMedia), bundle assembly, and a minimal
+`Info.plist` with `LSUIElement` — see `build.sh` for the exact steps.
 
 ## Keeping the session alive
 
@@ -153,10 +121,11 @@ start failures right after wake are retried automatically.
 
 ### Verifying
 
-Run the binary from a terminal so you can see its output:
+Run `./build.sh run` (builds and runs from the terminal so you can see its
+output):
 
 ```bash
-./CompositorFix.app/Contents/MacOS/CompositorFix
+./build.sh run
 ```
 
 Trigger each scenario and confirm the log ends in `capture ACTIVE`:
