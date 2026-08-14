@@ -129,6 +129,49 @@ EOF
 open CompositorFix.app
 ```
 
+## Keeping the session alive
+
+`SCStream` sessions are invalidated by the system whenever the display
+environment changes:
+
+- the Mac sleeps or wakes (including closing / opening the lid),
+- the screen is locked or unlocked,
+- displays are connected or disconnected (e.g. a docking station),
+- a display wakes from display sleep.
+
+CompositorFix now watches for these events and automatically recreates the
+capture session:
+
+- `NSWorkspace.didWakeNotification` / `screensDidWakeNotification` (sleep/wake)
+- `NSWorkspace.sessionDidBecomeActiveNotification` (unlock)
+- `NSApplication.didChangeScreenParametersNotification` (dock, external displays)
+
+The stream delegate (`SCStreamDelegate.stream(_:didStopWithError:)`) restarts
+the session if the system kills it for any other reason.  Restarts are
+debounced (dock transitions fire a burst of notifications) and transient
+start failures right after wake are retried automatically.
+
+### Verifying
+
+Run the binary from a terminal so you can see its output:
+
+```bash
+./CompositorFix.app/Contents/MacOS/CompositorFix
+```
+
+Trigger each scenario and confirm the log ends in `capture ACTIVE`:
+
+| Scenario | Expected log |
+|---|---|
+| Lock, then unlock the screen | `stream stopped unexpectedly` → `capture ACTIVE` |
+| Sleep (`pmset sleepnow` or close the lid), then wake | `environment changed: ...` → `capture ACTIVE` |
+| Attach/detach a docking station or external display | `environment changed: ...` → `capture ACTIVE` |
+| Disable via the menu, then re-enable | `capture STOPPED` → `capture ACTIVE` |
+
+Note: replacing the binary can reset the Screen Recording grant.  If the log
+shows a permission error, re-grant it in System Settings → Privacy & Security
+→ Screen Recording, then relaunch.
+
 ## Important disclaimer
 
 This is an experimental workaround.
