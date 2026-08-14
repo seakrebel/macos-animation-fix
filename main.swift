@@ -2,16 +2,140 @@ import AppKit
 import ScreenCaptureKit
 import CoreMedia
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, SCStreamDelegate {
 
     private var statusItem: NSStatusItem!
     private var stream: SCStream?
     private var enabled = false
 
+    // Whether the user wants the capture session running.  The actual stream
+    // (`enabled`) can be down while `wantsEnabled` stays true (e.g. while the
+    // screen is locked), which is what lets us automatically recover later.
+    private var wantsEnabled = true
+
+    // Coalesces the burst of environment-change events.  Dock transitions,
+    // wake-from-sleep and display reconfiguration all fire several
+    // notifications in quick succession, so we debounce restarts.
+    private var restartWorkItem: DispatchWorkItem?
+
+    // Pending delayed start after discarding an old stream.
+    private var startWorkItem: DispatchWorkItem?
+
+    // Pending retry after a transient start failure (e.g. right after wake).
+    private var retryWorkItem: DispatchWorkItem?
+
+    // Bumped on every new start/stop cycle; in-flight async captures from a
+    // superseded cycle are ignored.
+    private var startToken = 0
+
+    private var retryCount = 0
+
+    // True while we are deliberately stopping a stream, so an unexpected-stop
+    // callback for it is not mistaken for a crash.
+    private var stoppingDeliberately = false
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupMenuBar()
+        observeSystemEvents()
+        wantsEnabled = true
         startCapture()
     }
+
+    // MARK: - System event observation
+
+    private func observeSystemEvents() {
+        let nc = NSWorkspace.shared.notificationCenter
+
+        // System wake from sleep (including opening the lid).
+        nc.addObserver(
+            self,
+            selector: #selector(environmentChanged(_:)),
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
+
+        // Displays waking (display sleep without full system sleep).
+        nc.addObserver(
+            self,
+            selector: #selector(environmentChanged(_:)),
+            name: NSWorkspace.screensDidWakeNotification,
+            object: nil
+        )
+
+        // User session becomes active again (unlock / fast user switching).
+        nc.addObserver(
+            self,
+            selector: #selector(environmentChanged(_:)),
+            name: NSWorkspace.sessionDidBecomeActiveNotification,
+            object: nil
+        )
+
+        // Display configuration changes: docking stations, external display
+        // connect/disconnect, resolution changes.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(environmentChanged(_:)),
+            name: NSApplication.didChangeScreenParametersNotification,
+            object: nil
+        )
+    }
+
+    @objc private func environmentChanged(_ notification: Notification) {
+        print(
+            "CompositorFix: environment changed: " +
+            notification.name.rawValue
+        )
+        scheduleRestart()
+    }
+
+    private func scheduleRestart() {
+        guard wantsEnabled else {
+            return
+        }
+
+        cancelPendingWork()
+
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.restartCapture()
+        }
+        restartWorkItem = workItem
+
+        // Give the display configuration time to settle after the event.
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + 2.0,
+            execute: workItem
+        )
+    }
+
+    private func restartCapture() {
+        restartWorkItem = nil
+        retryCount = 0
+        stoppingDeliberately = true
+
+        if let stream {
+            // The system may have invalidated this stream (sleep, lock,
+            // display change); discard it and build a fresh one.
+            self.stream = nil
+            enabled = false
+            updateMenu()
+
+            print("CompositorFix: discarding old stream before restart")
+            stream.stopCapture { _ in }
+        }
+
+        // Let the old session tear down before creating a new one.
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.startCapture()
+        }
+        startWorkItem = workItem
+
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + 0.5,
+            execute: workItem
+        )
+    }
+
+    // MARK: - Menu bar
 
     private func setupMenuBar() {
         statusItem = NSStatusBar.system.statusItem(
@@ -72,17 +196,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func toggleCapture() {
-        if enabled {
-            stopCapture()
-        } else {
+        wantsEnabled.toggle()
+
+        if wantsEnabled {
+            retryCount = 0
+            cancelPendingWork()
             startCapture()
+        } else {
+            stopCapture()
         }
     }
 
+    private func cancelPendingWork() {
+        restartWorkItem?.cancel()
+        restartWorkItem = nil
+        startWorkItem?.cancel()
+        startWorkItem = nil
+        retryWorkItem?.cancel()
+        retryWorkItem = nil
+        startToken += 1
+    }
+
+    // MARK: - Capture lifecycle
+
     private func startCapture() {
+        guard wantsEnabled else {
+            return
+        }
         guard !enabled else {
             return
         }
+
+        startWorkItem = nil
+        stoppingDeliberately = false
+        startToken += 1
+        let token = startToken
 
         print("CompositorFix: starting capture...")
 
@@ -95,21 +243,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self else {
                     return
                 }
+                guard token == self.startToken else {
+                    return  // superseded by a newer start/stop cycle
+                }
 
                 if let error {
-                    print("CompositorFix: ERROR getting display:")
-                    print(error)
-
-                    self.enabled = false
-                    self.updateMenu()
+                    self.handleStartFailure(
+                        "ERROR getting display",
+                        error
+                    )
                     return
                 }
 
                 guard let display = content?.displays.first else {
-                    print("CompositorFix: ERROR: no display found")
-
-                    self.enabled = false
-                    self.updateMenu()
+                    self.handleStartFailure(
+                        "ERROR: no display found",
+                        nil
+                    )
                     return
                 }
 
@@ -136,7 +286,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let stream = SCStream(
                     filter: filter,
                     configuration: configuration,
-                    delegate: nil
+                    delegate: self
                 )
 
                 self.stream = stream
@@ -146,6 +296,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         guard let self else {
                             return
                         }
+                        guard token == self.startToken else {
+                            return
+                        }
 
                         if let error {
                             print(
@@ -153,7 +306,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             )
                             print(error)
 
-                            self.stream = nil
+                            if self.stream === stream {
+                                self.stream = nil
+                            }
                             self.enabled = false
                             self.updateMenu()
                             return
@@ -171,7 +326,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func handleStartFailure(_ message: String, _ error: Error?) {
+        print("CompositorFix: \(message)")
+        if let error {
+            print(error)
+        }
+
+        // Failures right after wake/lock are often transient (the display
+        // pipeline is still coming up).  Retry briefly, then give up and
+        // wait for the next system event to try again.
+        guard retryCount < 5 else {
+            print(
+                "CompositorFix: giving up after repeated failures"
+            )
+            enabled = false
+            updateMenu()
+            return
+        }
+
+        retryCount += 1
+        let delay = Double(retryCount) * 2.0
+        print(
+            "CompositorFix: retrying in \(delay)s " +
+            "(attempt \(retryCount)/5)"
+        )
+
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.startCapture()
+        }
+        retryWorkItem = workItem
+
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + delay,
+            execute: workItem
+        )
+    }
+
     private func stopCapture() {
+        cancelPendingWork()
+        stoppingDeliberately = true
+
         guard let stream else {
             enabled = false
             updateMenu()
@@ -193,7 +387,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     print(error)
                 }
 
-                self.stream = nil
+                if self.stream === stream {
+                    self.stream = nil
+                }
                 self.enabled = false
                 self.updateMenu()
 
@@ -204,7 +400,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // MARK: - SCStreamDelegate
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        print("CompositorFix: stream stopped unexpectedly:")
+        print(error)
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self else {
+                return
+            }
+
+            // Only react to the stream we currently care about, and only if
+            // we did not stop it ourselves (toggle/quit/restart).
+            guard self.stream === stream else {
+                return
+            }
+            guard !self.stoppingDeliberately else {
+                return
+            }
+
+            self.stream = nil
+            self.enabled = false
+            self.updateMenu()
+
+            print("CompositorFix: scheduling restart")
+            self.scheduleRestart()
+        }
+    }
+
+    // MARK: - Quit
+
     @objc private func quit() {
+        cancelPendingWork()
+        stoppingDeliberately = true
+
         if let stream {
             stream.stopCapture { _ in
                 DispatchQueue.main.async {
