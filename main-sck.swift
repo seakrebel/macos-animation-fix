@@ -1,34 +1,26 @@
 //
-//  AnimationFix — default build (CGDisplayStream, no replayd)
+//  AnimationFixSck — ScreenCaptureKit variant
 //
-//  Keeps a minimal display capture session alive to restore smooth UI
-//  animations, implemented with the legacy CoreGraphics `CGDisplayStream`
-//  API instead of ScreenCaptureKit.
+//  Alternative build (./build.sh sck): the same menu-bar app, but the
+//  capture session is a ScreenCaptureKit `SCStream` instead of a legacy
+//  `CGDisplayStream`.  This is the officially supported API — it is the
+//  fallback if a future macOS ever removes the obsoleted CGDisplayStream
+//  symbols (the default build's only weak spot).
 //
-//  Why this is the default: the same effect as the SCK variant, but with no
-//  `replayd` daemon in the loop — `CGDisplayStream` is driven directly by
-//  the WindowServer display-capture pipeline and hands frames to this
-//  process via IOSurface.  Frames are deliberately ignored.
-//
-//  Differences vs. the SCK variant (main-sck.swift, ./build.sh sck):
-//    - No `replayd` involvement (no SCStream, no content discovery).
-//    - The whole display is captured (no window exclusion) and downscaled to
-//      64 × 36 at 1 FPS.
-//    - `CGDisplayStream` is obsolete in the macOS 15+ SDK; build.sh targets
-//      macOS 14 so the symbols remain callable (still present at runtime on
-//      macOS 26/27 — verified).  If a future macOS removes them, fall back
-//      to the SCK variant: ./build.sh sck.
+//  Differences vs. the default (main.swift):
+//    - Routes through `replayd` (an extra system daemon for the session).
+//    - Supports window exclusion and an explicit `SCStreamOutput`, which the
+//      default build deliberately omits (frames are never delivered).
 //
 
 import AppKit
-import CoreGraphics
-import CoreVideo
-import IOSurface
+import ScreenCaptureKit
+import CoreMedia
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, SCStreamDelegate {
 
     private var statusItem: NSStatusItem!
-    private var displayStream: CGDisplayStream?
+    private var stream: SCStream?
     private var enabled = false
 
     // Whether the user wants the capture session running.  The actual stream
@@ -47,20 +39,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // Pending retry after a transient start failure (e.g. right after wake).
     private var retryWorkItem: DispatchWorkItem?
 
-    // Bumped on every new start/stop cycle; in-flight async work from a
-    // superseded cycle is ignored.
+    // Bumped on every new start/stop cycle; in-flight async captures from a
+    // superseded cycle are ignored.
     private var startToken = 0
 
     private var retryCount = 0
 
-    // True while we are deliberately stopping, so an unexpected `.stopped`
-    // callback for the stream is not mistaken for a crash.
+    // True while we are deliberately stopping a stream, so an unexpected-stop
+    // callback for it is not mistaken for a crash.
     private var stoppingDeliberately = false
-
-    // Frames delivered to our (ignored) handler; used to detect a stream that
-    // never actually starts (typically missing Screen Recording permission).
-    private var framesSeen = 0
-    private var watchdogWorkItem: DispatchWorkItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupMenuBar()
@@ -110,7 +97,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func environmentChanged(_ notification: Notification) {
         print(
-            "AnimationFix: environment changed: " +
+            "AnimationFixSck: environment changed: " +
             notification.name.rawValue
         )
         scheduleRestart()
@@ -140,15 +127,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         retryCount = 0
         stoppingDeliberately = true
 
-        if let displayStream {
+        if let stream {
             // The system may have invalidated this stream (sleep, lock,
             // display change); discard it and build a fresh one.
-            self.displayStream = nil
+            self.stream = nil
             enabled = false
             updateMenu()
 
-            print("AnimationFix: discarding old stream before restart")
-            displayStream.stop()
+            print("AnimationFixSck: discarding old stream before restart")
+            stream.stopCapture { _ in }
         }
 
         // Let the old session tear down before creating a new one.
@@ -172,13 +159,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         if let button = statusItem.button {
             button.title = "◉"
-            button.toolTip = "AnimationFix"
+            button.toolTip = "AnimationFixSck"
         }
 
         let menu = NSMenu()
 
         let titleItem = NSMenuItem(
-            title: "AnimationFix",
+            title: "AnimationFixSck",
             action: nil,
             keyEquivalent: ""
         )
@@ -242,8 +229,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         startWorkItem = nil
         retryWorkItem?.cancel()
         retryWorkItem = nil
-        watchdogWorkItem?.cancel()
-        watchdogWorkItem = nil
         startToken += 1
     }
 
@@ -260,123 +245,104 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         startWorkItem = nil
         stoppingDeliberately = false
         startToken += 1
+        let token = startToken
 
-        print("AnimationFix: starting capture...")
+        print("AnimationFixSck: starting capture...")
 
-        let displayID = CGMainDisplayID()
-        guard displayID != kCGNullDirectDisplay else {
-            handleStartFailure("ERROR: no display found", nil)
-            return
-        }
+        SCShareableContent.getExcludingDesktopWindows(
+            false,
+            onScreenWindowsOnly: true
+        ) { [weak self] content, error in
 
-        print("AnimationFix: using display \(displayID)")
-
-        let pixelFormat = Int32(bitPattern: kCVPixelFormatType_32BGRA)
-
-        let properties: [CFString: Any] = [
-            // 1 FPS — minimum time between delivered frames, in seconds.
-            CGDisplayStream.minimumFrameTime: 1.0,
-            CGDisplayStream.showCursor: false,
-            // Queue as few frames as possible; we ignore them anyway.
-            CGDisplayStream.queueDepth: 1,
-        ]
-
-        let handler: CGDisplayStreamFrameAvailableHandler = { [weak self] status, _, _, _ in
-            // Deliberately ignore the frame surface — the session itself is
-            // all we need.  Only track liveness and unexpected stops.
-            guard let self else {
-                return
-            }
-
-            self.framesSeen += 1
-
-            if status == .stopped {
-                guard self.enabled else {
+            DispatchQueue.main.async {
+                guard let self else {
                     return
                 }
-                guard !self.stoppingDeliberately else {
+                guard token == self.startToken else {
+                    return  // superseded by a newer start/stop cycle
+                }
+
+                if let error {
+                    self.handleStartFailure(
+                        "ERROR getting display",
+                        error
+                    )
+                    return
+                }
+
+                guard let display = content?.displays.first else {
+                    self.handleStartFailure(
+                        "ERROR: no display found",
+                        nil
+                    )
                     return
                 }
 
                 print(
-                    "AnimationFix: stream stopped unexpectedly " +
-                    "(display asleep or disconnected); " +
-                    "scheduling restart"
+                    "AnimationFixSck: using display \(display.displayID)"
                 )
-                self.scheduleRestart()
-            }
-        }
 
-        // Swift overlay initializer for the legacy C function
-        // CGDisplayStreamCreateWithDispatchQueue().
-        guard let stream = CGDisplayStream(
-            dispatchQueueDisplay: displayID,
-            outputWidth: 64,
-            outputHeight: 36,
-            pixelFormat: pixelFormat,
-            properties: properties as CFDictionary,
-            queue: DispatchQueue.main,
-            handler: handler
-        ) else {
-            handleStartFailure(
-                "ERROR: CGDisplayStreamCreate returned nil",
-                nil
-            )
-            return
-        }
-
-        self.displayStream = stream
-
-        let error = stream.start()
-        guard error == .success else {
-            print("AnimationFix: ERROR starting capture:")
-            print(error.rawValue)
-
-            if self.displayStream === stream {
-                self.displayStream = nil
-            }
-            self.enabled = false
-            self.updateMenu()
-            return
-        }
-
-        self.enabled = true
-        self.updateMenu()
-
-        print(
-            "AnimationFix: capture ACTIVE " +
-            "(CGDisplayStream, no replayd)"
-        )
-
-        // If the stream is live, the handler fires (frame or idle status)
-        // roughly every second even on a static screen.  No callbacks at all
-        // usually means Screen Recording permission is missing.
-        framesSeen = 0
-        let watchdog = DispatchWorkItem { [weak self] in
-            guard let self else {
-                return
-            }
-            guard self.enabled else {
-                return
-            }
-            if self.framesSeen == 0 {
-                print(
-                    "AnimationFix: WARNING: no frames/idle callbacks " +
-                    "received — stream may be blocked.  Grant Screen " +
-                    "Recording in System Settings → Privacy & Security, " +
-                    "then relaunch."
+                let filter = SCContentFilter(
+                    display: display,
+                    excludingWindows: []
                 )
+
+                let configuration = SCStreamConfiguration()
+
+                configuration.width = 64
+                configuration.height = 36
+                configuration.minimumFrameInterval =
+                    CMTime(value: 1, timescale: 1)
+
+                configuration.showsCursor = false
+                configuration.capturesAudio = false
+                configuration.queueDepth = 1
+
+                let stream = SCStream(
+                    filter: filter,
+                    configuration: configuration,
+                    delegate: self
+                )
+
+                self.stream = stream
+
+                stream.startCapture { [weak self] error in
+                    DispatchQueue.main.async {
+                        guard let self else {
+                            return
+                        }
+                        guard token == self.startToken else {
+                            return
+                        }
+
+                        if let error {
+                            print(
+                                "AnimationFixSck: ERROR starting capture:"
+                            )
+                            print(error)
+
+                            if self.stream === stream {
+                                self.stream = nil
+                            }
+                            self.enabled = false
+                            self.updateMenu()
+                            return
+                        }
+
+                        self.enabled = true
+                        self.updateMenu()
+
+                        print(
+                            "AnimationFixSck: capture ACTIVE"
+                        )
+                    }
+                }
             }
         }
-        watchdogWorkItem = watchdog
-        DispatchQueue.main.asyncAfter(
-            deadline: .now() + 5.0,
-            execute: watchdog
-        )
     }
 
     private func handleStartFailure(_ message: String, _ error: Error?) {
-        print("AnimationFix: \(message)")
+        print("AnimationFixSck: \(message)")
         if let error {
             print(error)
         }
@@ -386,7 +352,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // wait for the next system event to try again.
         guard retryCount < 5 else {
             print(
-                "AnimationFix: giving up after repeated failures"
+                "AnimationFixSck: giving up after repeated failures"
             )
             enabled = false
             updateMenu()
@@ -396,7 +362,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         retryCount += 1
         let delay = Double(retryCount) * 2.0
         print(
-            "AnimationFix: retrying in \(delay)s " +
+            "AnimationFixSck: retrying in \(delay)s " +
             "(attempt \(retryCount)/5)"
         )
 
@@ -415,21 +381,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         cancelPendingWork()
         stoppingDeliberately = true
 
-        guard let displayStream else {
+        guard let stream else {
             enabled = false
             updateMenu()
             return
         }
 
-        print("AnimationFix: stopping capture...")
+        print("AnimationFixSck: stopping capture...")
 
-        displayStream.stop()
+        stream.stopCapture { [weak self] error in
+            DispatchQueue.main.async {
+                guard let self else {
+                    return
+                }
 
-        self.displayStream = nil
-        enabled = false
-        updateMenu()
+                if let error {
+                    print(
+                        "AnimationFixSck: error stopping capture:"
+                    )
+                    print(error)
+                }
 
-        print("AnimationFix: capture STOPPED")
+                if self.stream === stream {
+                    self.stream = nil
+                }
+                self.enabled = false
+                self.updateMenu()
+
+                print(
+                    "AnimationFixSck: capture STOPPED"
+                )
+            }
+        }
+    }
+
+    // MARK: - SCStreamDelegate
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        print("AnimationFixSck: stream stopped unexpectedly:")
+        print(error)
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self else {
+                return
+            }
+
+            // Only react to the stream we currently care about, and only if
+            // we did not stop it ourselves (toggle/quit/restart).
+            guard self.stream === stream else {
+                return
+            }
+            guard !self.stoppingDeliberately else {
+                return
+            }
+
+            self.stream = nil
+            self.enabled = false
+            self.updateMenu()
+
+            print("AnimationFixSck: scheduling restart")
+            self.scheduleRestart()
+        }
     }
 
     // MARK: - Quit
@@ -438,12 +450,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         cancelPendingWork()
         stoppingDeliberately = true
 
-        if let displayStream {
-            displayStream.stop()
-            self.displayStream = nil
+        if let stream {
+            stream.stopCapture { _ in
+                DispatchQueue.main.async {
+                    NSApplication.shared.terminate(nil)
+                }
+            }
+        } else {
+            NSApplication.shared.terminate(nil)
         }
-
-        NSApplication.shared.terminate(nil)
     }
 }
 
