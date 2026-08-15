@@ -62,8 +62,7 @@ Notes:
 `main-sck.swift` (built with `./build.sh sck` → `AnimationFixSck.app`) is the
 same menu-bar app with the capture session implemented as a ScreenCaptureKit
 `SCStream` instead of the legacy API.  It routes the session through the
-`replayd` daemon and supports window exclusion and an explicit
-`SCStreamOutput` (both omitted in this build — frames are never delivered).
+`replayd` daemon and supports window exclusion.
 
 The result is identical: with an `SCStream` session active at 64 × 36, 1 FPS,
 UI animations are **buttery smooth**.  This is the officially supported API,
@@ -73,6 +72,16 @@ so it is the fallback if a future macOS ever removes the obsoleted
 ```bash
 ./build.sh sck run     # or: ./build.sh sck install
 ```
+
+Thanks to the first-frame-latch finding, the SCK build is **optimized**: it
+starts at 1 FPS and, on the first delivered frame (detected by a
+frame-counting output that ignores the content), live-switches the stream to
+an effectively-zero frame rate via `SCStream.updateConfiguration` — no stop.
+The session stays alive but **stops producing frames**, and the smoothing
+effect persists (verified over many minutes of zero frame flow).  This is the
+lightest steady state of any variant.  (The default CG build cannot do this:
+`CGDisplayStream` has no way to change the frame rate on a running stream, so
+it keeps its 1 FPS pump.)
 
 ## Experimental observation
 
@@ -91,6 +100,7 @@ The behavior was isolated through the following tests:
 | `CGDisplayStream` (CoreGraphics, no replayd) | UI becomes smooth |
 | `CGDisplayStream` zero-rate (min frame time 1e9 s → no frames delivered) | UI stutters |
 | `CGDisplayStream` without `start()` (no capture session) | UI stutters |
+| `SCStream` @ 1 FPS → live switch to ~∞ (no stop) | UI stays smooth |
 
 The important observation is that **starting the capture session itself appears to
 be sufficient**. The application does not need to consume the captured frames.
@@ -98,13 +108,20 @@ be sufficient**. The application does not need to consume the captured frames.
 A zero-rate `CGDisplayStream` test narrows this further: with
 `minimumFrameTime` set to ~1e9 seconds (session active, but the pipeline is
 asked to never deliver a frame), UI animations **stutter again**.  So an
-active session alone is not enough — the display-capture pipeline must
-actually be **producing frames** at some rate for the effect to kick in,
-even though the app ignores every frame it receives.
+active session alone is not enough — the pipeline must actually produce
+frames.
 
-The no-`start()` control — stream object created but never started, so no
-capture session exists at all — also stutters, confirming the stream must
-actually be running for the effect to appear.
+The decisive test: an `SCStream` started at 1 FPS, then **live-switched to a
+~1e9 s frame interval without stopping** (via `SCStream.updateConfiguration`),
+stays **buttery smooth for many minutes with zero frames flowing**.  So the
+effect is a **first-frame latch**: WindowServer engages the smooth compositing
+mode once the capture pipeline delivers its first real frame, and afterwards
+only needs the session to stay alive — frame production can stop entirely.
+
+This reconciles all the rows: a zero-rate stream stutters because no first
+frame is ever produced to trip the latch; a created-but-never-started stream
+stutters because no session exists; and any session that produces at least
+one frame latches and stays smooth.
 
 This suggests that the effect is related to a system-level display/compositor
 state rather than simply increased GPU utilization, and that the relevant
@@ -123,14 +140,17 @@ state lives in the WindowServer display-capture/compositor pipeline itself
 You do **not** need the full Xcode application. The Xcode Command Line Tools
 are sufficient to compile the project.
 
-Two variants are built by the same script.  The default is the
-`CGDisplayStream` build (`main.swift` → `AnimationFix.app`); the
-ScreenCaptureKit build is one argument away (`main-sck.swift` →
-`AnimationFixSck.app`):
+Three builds share one script.  The default is the `CGDisplayStream` build
+(`main.swift` → `AnimationFix.app`); the ScreenCaptureKit build is one
+argument away (`main-sck.swift` → `AnimationFixSck.app`), as is the
+frame-rate-switch experiment harness (`main-sck-live.swift` →
+`AnimationFixSckLive.app` — the tool that produced the first-frame-latch
+result):
 
 ```bash
-./build.sh run        # default (CGDisplayStream, no replayd)
-./build.sh sck run    # ScreenCaptureKit (supported fallback)
+./build.sh run           # default (CGDisplayStream, no replayd)
+./build.sh sck run       # ScreenCaptureKit (supported fallback, latch-optimized)
+./build.sh sck-live run  # experiment: manual live rate switch + frame log
 ```
 
 ### 1. Clone the repository
@@ -212,12 +232,13 @@ shows a permission error, re-grant it in System Settings → Privacy & Security
 There are no known security vulnerabilities in this codebase.  The attack
 surface is deliberately minimal and the entire implementation is auditable.
 
-**The app never uses your screen content.**  The SCK build creates the
-`SCStream` without an `SCStreamOutput`, so frames are never delivered to the
-process.  The default CG build's frame handler is a no-op that discards
-every IOSurface immediately.  In both builds, frames are not buffered,
-encoded, logged, or stored anywhere.  The app's only effect is keeping the
-capture *session* active.
+**The app never uses your screen content.**  The default CG build's frame
+handler is a no-op that discards every IOSurface immediately.  The SCK build
+has a frame-counting output that discards every frame; once it has seen the
+first frame it switches the stream to an effectively-zero frame rate, so at
+most one frame per session is ever delivered to the process.  In both builds,
+frames are not buffered, encoded, logged, or stored anywhere.  The app's only
+effect is keeping the capture *session* active.
 
 **No other sensitive access:**
 
@@ -270,8 +291,9 @@ No active display-capture session
     ↓
 UI animations stutter
 
-Display-capture session whose frames are actually flowing
-(`SCStream` via replayd, or `CGDisplayStream` directly)
+Display-capture session that has delivered at least one frame
+(`SCStream` via replayd, or `CGDisplayStream` directly) —
+after that first frame the session only needs to stay alive
     ↓
 UI animations become smooth
 ```
