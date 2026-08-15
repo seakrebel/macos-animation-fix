@@ -1,25 +1,35 @@
 //
-//  AnimationFixSck — ScreenCaptureKit variant
+//  AnimationFixSckLive — live frame-rate switch experiment
 //
-//  Alternative build (./build.sh sck): the same menu-bar app, but the
-//  capture session is a ScreenCaptureKit `SCStream` instead of a legacy
-//  `CGDisplayStream`.  This is the officially supported API — it is the
-//  fallback if a future macOS ever removes the obsoleted CGDisplayStream
-//  symbols (the default build's only weak spot).
+//  Purpose: settle whether the smoothing effect needs continuous frame
+//  production ("ticking") or whether WindowServer latches into the smooth
+//  mode on the first real frame and thereafter only needs the stream to
+//  remain alive.
 //
-//  Differences vs. the default (main.swift):
-//    - Routes through `replayd` (an extra system daemon for the session).
-//    - Can change its frame rate on a running stream, which is what the
-//      latch optimization below uses.
+//  Hypothesis A (ticking): the effect requires periodic frame production;
+//  if we stop delivering frames, UI stutters again.
+//  Hypothesis B (latch): once the first frame has been delivered, the
+//  smooth mode persists as long as the capture stream stays alive — even if
+//  frames stop flowing.
 //
-//  Latch optimization (verified by experiment): WindowServer engages the
-//  smooth compositing mode once the capture pipeline delivers its first
-//  real frame, and afterwards only needs the session to stay alive — frame
-//  production can stop entirely (a live switch to an ∞ frame interval left
-//  the UI smooth for many minutes).  So this build starts at 1 FPS and, on
-//  the first delivered frame, switches the stream's minimumFrameInterval to
-//  ~1e9 s via SCStream.updateConfiguration without stopping.  The session
-//  stays alive but silent.
+//  Why not the CGDisplayStream path?  CGDisplayStream has no API to change
+//  `minimumFrameTime` on a running stream (properties are read at creation),
+//  so "change interval to ~∞ without stopping" is impossible there.
+//  ScreenCaptureKit supports live reconfiguration via
+//  `SCStream.updateConfiguration(_:completionHandler:)`, so this variant
+//  uses SCK.
+//
+//  How to read the result:
+//    - Start at 1 FPS (baseline, smooth).  Then use the menu to switch the
+//      interval to ∞ (1e9 s — effectively no frames) WITHOUT stopping the
+//      stream.
+//    - UI stays smooth  → hypothesis B (latch; aliveness is enough).
+//    - UI stutters again → hypothesis A (frames must keep flowing).
+//
+//  Instrumentation: a frame-counting `SCStreamOutput` (content ignored)
+//  logs the actually-delivered frame rate, so the log proves the switch
+//  really stopped frame delivery (otherwise a "stays smooth" result would
+//  be ambiguous — it could just mean the config change didn't take).
 //
 
 import AppKit
@@ -62,16 +72,54 @@ final class AppDelegate: NSObject,
     // callback for it is not mistaken for a crash.
     private var stoppingDeliberately = false
 
-    // Latch optimization: once the current session has delivered its first
-    // real frame, the stream switches to an effectively-zero frame rate
-    // (session stays alive, no more frames).  Reset on every (re)start.
-    private var latchedQuiet = false
+    // ---- live rate-switch experiment state ----
+
+    // The frame interval the stream currently uses.  Changed live through
+    // the menu (updateConfiguration) and re-applied on stream restarts.
+    private var currentInterval = CMTime(value: 1, timescale: 1)  // 1 s → 1 FPS
+
+    // Frames delivered by SCStreamOutput in the current window (main queue
+    // only, so no locking needed).
+    private var frameCount = 0
+
+    // Periodically logs the delivered frame rate.
+    private var rateLogTimer: Timer?
+
+    // MARK: - Application lifecycle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupMenuBar()
         observeSystemEvents()
         wantsEnabled = true
         startCapture()
+
+        // Log the delivered frame rate every 10 s so the log shows the rate
+        // actually changing after each menu switch.
+        rateLogTimer = Timer.scheduledTimer(
+            withTimeInterval: 10.0,
+            repeats: true
+        ) { [weak self] _ in
+            self?.logFrameRate()
+        }
+
+        // Optional automated test hook: with ANIMFIX_AUTOSWITCH=<seconds>
+        // set, switch to ∞ after that delay and back to 1 FPS after another
+        // delay.  Lets the live-switch path be verified headlessly; normal
+        // runs are unaffected (env var unset).
+        if let s = ProcessInfo.processInfo.environment["ANIMFIX_AUTOSWITCH"],
+           let delay = Double(s)
+        {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                [weak self] in
+                print("AnimationFixSckLive: [autoswitch] → ∞")
+                self?.applyRate(tag: 203)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay * 2) {
+                [weak self] in
+                print("AnimationFixSckLive: [autoswitch] → 1 FPS")
+                self?.applyRate(tag: 201)
+            }
+        }
     }
 
     // MARK: - System event observation
@@ -115,7 +163,7 @@ final class AppDelegate: NSObject,
 
     @objc private func environmentChanged(_ notification: Notification) {
         print(
-            "AnimationFixSck: environment changed: " +
+            "AnimationFixSckLive: environment changed: " +
             notification.name.rawValue
         )
         scheduleRestart()
@@ -152,7 +200,7 @@ final class AppDelegate: NSObject,
             enabled = false
             updateMenu()
 
-            print("AnimationFixSck: discarding old stream before restart")
+            print("AnimationFixSckLive: discarding old stream before restart")
             stream.stopCapture { _ in }
         }
 
@@ -177,13 +225,13 @@ final class AppDelegate: NSObject,
 
         if let button = statusItem.button {
             button.title = "◉"
-            button.toolTip = "AnimationFixSck"
+            button.toolTip = "AnimationFixSckLive"
         }
 
         let menu = NSMenu()
 
         let titleItem = NSMenuItem(
-            title: "AnimationFixSck",
+            title: "AnimationFixSckLive",
             action: nil,
             keyEquivalent: ""
         )
@@ -200,6 +248,44 @@ final class AppDelegate: NSObject,
         enabledItem.target = self
         enabledItem.tag = 100
         menu.addItem(enabledItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        // Live frame-rate switches (applied without stopping the stream).
+        let rateTitle = NSMenuItem(
+            title: "Frame interval (live)",
+            action: nil,
+            keyEquivalent: ""
+        )
+        rateTitle.isEnabled = false
+        menu.addItem(rateTitle)
+
+        let rate1fps = NSMenuItem(
+            title: "1 FPS (1 s)",
+            action: #selector(setRate(_:)),
+            keyEquivalent: ""
+        )
+        rate1fps.target = self
+        rate1fps.tag = 201
+        menu.addItem(rate1fps)
+
+        let rate01fps = NSMenuItem(
+            title: "0.1 FPS (10 s)",
+            action: #selector(setRate(_:)),
+            keyEquivalent: ""
+        )
+        rate01fps.target = self
+        rate01fps.tag = 202
+        menu.addItem(rate01fps)
+
+        let rateInf = NSMenuItem(
+            title: "∞ (1e9 s — no frames)",
+            action: #selector(setRate(_:)),
+            keyEquivalent: ""
+        )
+        rateInf.target = self
+        rateInf.tag = 203
+        menu.addItem(rateInf)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -222,6 +308,19 @@ final class AppDelegate: NSObject,
         }
 
         enabledItem.state = enabled ? .on : .off
+
+        // Check the rate item matching the current interval.
+        let tag: Int
+        if currentInterval.value == 1, currentInterval.timescale == 1 {
+            tag = 201
+        } else if currentInterval.value == 10, currentInterval.timescale == 1 {
+            tag = 202
+        } else {
+            tag = 203
+        }
+        for t in [201, 202, 203] {
+            menu.item(withTag: t)?.state = (t == tag) ? .on : .off
+        }
 
         if let button = statusItem.button {
             button.title = enabled ? "●" : "○"
@@ -250,7 +349,91 @@ final class AppDelegate: NSObject,
         startToken += 1
     }
 
+    // MARK: - Live rate switching (the experiment)
+
+    @objc private func setRate(_ sender: NSMenuItem) {
+        applyRate(tag: sender.tag)
+    }
+
+    private func applyRate(tag: Int) {
+        let interval: CMTime
+        let label: String
+
+        switch tag {
+        case 201:
+            interval = CMTime(value: 1, timescale: 1)          // 1 s
+            label = "1 FPS"
+        case 202:
+            interval = CMTime(value: 10, timescale: 1)         // 10 s
+            label = "0.1 FPS"
+        case 203:
+            interval = CMTime(value: 1, timescale: 1_000_000_000)  // 1e9 s
+            label = "∞ (1e9 s)"
+        default:
+            return
+        }
+
+        currentInterval = interval
+        updateMenu()
+
+        guard let stream, enabled else {
+            print(
+                "AnimationFixSckLive: rate set to \(label) " +
+                "(applies on next start)"
+            )
+            return
+        }
+
+        print(
+            "AnimationFixSckLive: switching rate to \(label) " +
+            "live (no stop)..."
+        )
+
+        stream.updateConfiguration(makeConfiguration()) { [weak self] error in
+            DispatchQueue.main.async {
+                guard let self else {
+                    return
+                }
+                if let error {
+                    print(
+                        "AnimationFixSckLive: updateConfiguration error:"
+                    )
+                    print(error)
+                    return
+                }
+                print(
+                    "AnimationFixSckLive: rate now \(label) — " +
+                    "frames delivered since last log: \(self.frameCount)"
+                )
+                self.frameCount = 0
+            }
+        }
+    }
+
+    private func logFrameRate() {
+        let n = frameCount
+        frameCount = 0
+        print(
+            "AnimationFixSckLive: frames delivered in last 10 s: \(n) " +
+            "(interval \(currentInterval.value)/\(currentInterval.timescale) s)"
+        )
+    }
+
     // MARK: - Capture lifecycle
+
+    private func makeConfiguration() -> SCStreamConfiguration {
+        let configuration = SCStreamConfiguration()
+
+        configuration.width = 64
+        configuration.height = 36
+        configuration.minimumFrameInterval = currentInterval
+
+        configuration.showsCursor = false
+        configuration.capturesAudio = false
+        configuration.queueDepth = 1
+
+        return configuration
+    }
 
     private func startCapture() {
         guard wantsEnabled else {
@@ -265,7 +448,7 @@ final class AppDelegate: NSObject,
         startToken += 1
         let token = startToken
 
-        print("AnimationFixSck: starting capture...")
+        print("AnimationFixSckLive: starting capture...")
 
         SCShareableContent.getExcludingDesktopWindows(
             false,
@@ -297,7 +480,7 @@ final class AppDelegate: NSObject,
                 }
 
                 print(
-                    "AnimationFixSck: using display \(display.displayID)"
+                    "AnimationFixSckLive: using display \(display.displayID)"
                 )
 
                 let filter = SCContentFilter(
@@ -311,22 +494,27 @@ final class AppDelegate: NSObject,
                     delegate: self
                 )
 
-                // Latch detector: count delivered frames (content ignored)
-                // so we know the pipeline produced its first real frame.
+                // Instrumentation only: count delivered frames so the log
+                // shows the real rate after each live switch.  Content is
+                // never inspected.
                 do {
                     try stream.addStreamOutput(
                         self,
                         type: .screen,
                         sampleHandlerQueue: DispatchQueue.main
                     )
-                    print("AnimationFixSck: added frame detector")
+                    print(
+                        "AnimationFixSckLive: added frame-counting output"
+                    )
                 } catch {
-                    print("AnimationFixSck: ERROR adding frame detector:")
+                    print(
+                        "AnimationFixSckLive: ERROR adding output:"
+                    )
                     print(error)
                 }
 
                 self.stream = stream
-                self.latchedQuiet = false
+                self.frameCount = 0
 
                 stream.startCapture { [weak self] error in
                     DispatchQueue.main.async {
@@ -339,7 +527,7 @@ final class AppDelegate: NSObject,
 
                         if let error {
                             print(
-                                "AnimationFixSck: ERROR starting capture:"
+                                "AnimationFixSckLive: ERROR starting capture:"
                             )
                             print(error)
 
@@ -355,8 +543,9 @@ final class AppDelegate: NSObject,
                         self.updateMenu()
 
                         print(
-                            "AnimationFixSck: capture ACTIVE " +
-                            "(1 FPS; going quiet after first frame)"
+                            "AnimationFixSckLive: capture ACTIVE " +
+                            "(interval \(self.currentInterval.value)/" +
+                            "\(self.currentInterval.timescale) s)"
                         )
                     }
                 }
@@ -365,7 +554,7 @@ final class AppDelegate: NSObject,
     }
 
     private func handleStartFailure(_ message: String, _ error: Error?) {
-        print("AnimationFixSck: \(message)")
+        print("AnimationFixSckLive: \(message)")
         if let error {
             print(error)
         }
@@ -375,7 +564,7 @@ final class AppDelegate: NSObject,
         // wait for the next system event to try again.
         guard retryCount < 5 else {
             print(
-                "AnimationFixSck: giving up after repeated failures"
+                "AnimationFixSckLive: giving up after repeated failures"
             )
             enabled = false
             updateMenu()
@@ -385,7 +574,7 @@ final class AppDelegate: NSObject,
         retryCount += 1
         let delay = Double(retryCount) * 2.0
         print(
-            "AnimationFixSck: retrying in \(delay)s " +
+            "AnimationFixSckLive: retrying in \(delay)s " +
             "(attempt \(retryCount)/5)"
         )
 
@@ -410,7 +599,7 @@ final class AppDelegate: NSObject,
             return
         }
 
-        print("AnimationFixSck: stopping capture...")
+        print("AnimationFixSckLive: stopping capture...")
 
         stream.stopCapture { [weak self] error in
             DispatchQueue.main.async {
@@ -420,7 +609,7 @@ final class AppDelegate: NSObject,
 
                 if let error {
                     print(
-                        "AnimationFixSck: error stopping capture:"
+                        "AnimationFixSckLive: error stopping capture:"
                     )
                     print(error)
                 }
@@ -432,29 +621,13 @@ final class AppDelegate: NSObject,
                 self.updateMenu()
 
                 print(
-                    "AnimationFixSck: capture STOPPED"
+                    "AnimationFixSckLive: capture STOPPED"
                 )
             }
         }
     }
 
-    // MARK: - SCStreamOutput / latch optimization
-
-    private func makeConfiguration(
-        interval: CMTime = CMTime(value: 1, timescale: 1)
-    ) -> SCStreamConfiguration {
-        let configuration = SCStreamConfiguration()
-
-        configuration.width = 64
-        configuration.height = 36
-        configuration.minimumFrameInterval = interval
-
-        configuration.showsCursor = false
-        configuration.capturesAudio = false
-        configuration.queueDepth = 1
-
-        return configuration
-    }
+    // MARK: - SCStreamOutput
 
     func stream(
         _ stream: SCStream,
@@ -464,47 +637,14 @@ final class AppDelegate: NSObject,
         guard outputType == .screen else {
             return
         }
-        // Only the current session's frames count (a stale frame from a
-        // superseded stream must not trip the latch early).
-        guard stream === self.stream else {
-            return
-        }
-        guard !latchedQuiet else {
-            return
-        }
-
-        latchedQuiet = true
-
-        print(
-            "AnimationFixSck: first frame delivered — switching to " +
-            "quiet mode (∞) live, no stop"
-        )
-
-        // The smooth mode is latched by the first real frame; the session
-        // only needs to stay alive now, so stop producing frames.
-        stream.updateConfiguration(
-            makeConfiguration(
-                interval: CMTime(value: 1, timescale: 1_000_000_000)
-            )
-        ) { error in
-            DispatchQueue.main.async {
-                if let error {
-                    print("AnimationFixSck: updateConfiguration error:")
-                    print(error)
-                    return
-                }
-                print(
-                    "AnimationFixSck: quiet mode ACTIVE " +
-                    "(session alive, no frames delivered)"
-                )
-            }
-        }
+        // Count only.  The frame content is deliberately ignored.
+        frameCount += 1
     }
 
     // MARK: - SCStreamDelegate
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        print("AnimationFixSck: stream stopped unexpectedly:")
+        print("AnimationFixSckLive: stream stopped unexpectedly:")
         print(error)
 
         DispatchQueue.main.async { [weak self] in
@@ -525,7 +665,7 @@ final class AppDelegate: NSObject,
             self.enabled = false
             self.updateMenu()
 
-            print("AnimationFixSck: scheduling restart")
+            print("AnimationFixSckLive: scheduling restart")
             self.scheduleRestart()
         }
     }

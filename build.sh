@@ -11,6 +11,8 @@ usage() {
     echo ""
     echo "  variant  cg (default)  CGDisplayStream — no replayd, lighter"
     echo "           sck           ScreenCaptureKit — officially supported"
+    echo "           sck-live      experiment: live frame-rate switch"
+    echo "                         (SCK + updateConfiguration, no stop)"
     echo ""
     echo "  (no args)    build the app in the current directory"
     echo "  run          build and run from the terminal (shows its log)"
@@ -19,10 +21,11 @@ usage() {
     echo "Examples:"
     echo "  $0 run        # main.swift → AnimationFix.app (default)"
     echo "  $0 sck run    # main-sck.swift → AnimationFixSck.app"
+    echo "  $0 sck-live run  # main-sck-live.swift → AnimationFixSckLive.app"
 }
 
 case "${1:-}" in
-    cg|sck)
+    cg|sck|sck-live)
         VARIANT="$1"
         shift || true
         ;;
@@ -45,8 +48,9 @@ case "${1:-}" in
 esac
 
 case "$VARIANT" in
-    cg)  SRC="main.swift";     APP_NAME="AnimationFix" ;;
-    sck) SRC="main-sck.swift"; APP_NAME="AnimationFixSck" ;;
+    cg)  SRC="main.swift";        APP_NAME="AnimationFix" ;;
+    sck) SRC="main-sck.swift";    APP_NAME="AnimationFixSck" ;;
+    sck-live) SRC="main-sck-live.swift"; APP_NAME="AnimationFixSckLive" ;;
 esac
 
 build() {
