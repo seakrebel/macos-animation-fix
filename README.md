@@ -1,7 +1,12 @@
 # macOS Animation Fix
 
 A tiny macOS menu bar utility that works around a macOS UI animation
-stuttering issue by keeping a minimal ScreenCaptureKit capture session active.
+stuttering issue by keeping a minimal display-capture session active.
+
+The default build uses the legacy CoreGraphics `CGDisplayStream` API — the
+same effect as ScreenCaptureKit, but with no `replayd` daemon in the loop.
+An officially supported ScreenCaptureKit variant (`main-sck.swift`) ships
+alongside it and is one build flag away (`./build.sh sck`).
 
 ## The problem
 
@@ -21,21 +26,53 @@ smooth again.
 This project explores and provides a lightweight way of reproducing that effect
 without actually recording or processing the screen.
 
-## Current workaround
+## Current workaround (default: CGDisplayStream)
 
-The application starts a minimal `ScreenCaptureKit` `SCStream`:
+The default build starts a minimal legacy `CGDisplayStream` session, driven
+directly by the WindowServer display-capture pipeline — no `replayd` daemon
+is involved:
 
 - 64 × 36 capture resolution
 - 1 FPS
-- no audio
 - no cursor
-- no `SCStreamOutput`
-- captured frames are not processed or encoded
+- frames delivered to the app via IOSurface are ignored (nothing is buffered,
+  encoded, logged, or stored)
 
-The stream is simply kept active.
+The session is simply kept active.
 
-Despite the extremely small capture configuration, starting the stream can
-restore smooth UI animations.
+Despite the extremely small capture configuration, keeping it running
+restores smooth UI animations — **buttery smooth** on macOS 26/27.
+
+This is a significant narrowing of the mechanism: the smoothing effect does
+**not** require ScreenCaptureKit or `replayd`.  An active display-capture
+session at the WindowServer level is sufficient — provided the pipeline is
+actually delivering frames (see the zero-rate test below, which stutters).
+
+Notes:
+
+- `CGDisplayStream` is marked obsolete in the macOS 15+ SDK.  `build.sh`
+  compiles it with a macOS 14 deployment target so the symbols remain
+  callable; they still exist at runtime on macOS 26/27 — verified.  If a
+  future macOS removes them, switch to the SCK variant: `./build.sh sck`.
+- Unlike the SCK variant, `CGDisplayStream` captures the whole display (no
+  window exclusion), downscaled to 64 × 36 at 1 FPS.
+
+### ScreenCaptureKit variant (the supported fallback)
+
+`main-sck.swift` (built with `./build.sh sck` → `AnimationFixSck.app`) is the
+same menu-bar app with the capture session implemented as a ScreenCaptureKit
+`SCStream` instead of the legacy API.  It routes the session through the
+`replayd` daemon and supports window exclusion and an explicit
+`SCStreamOutput` (both omitted in this build — frames are never delivered).
+
+The result is identical: with an `SCStream` session active at 64 × 36, 1 FPS,
+UI animations are **buttery smooth**.  This is the officially supported API,
+so it is the fallback if a future macOS ever removes the obsoleted
+`CGDisplayStream` symbols:
+
+```bash
+./build.sh sck run     # or: ./build.sh sck install
+```
 
 ## Experimental observation
 
@@ -51,12 +88,28 @@ The behavior was isolated through the following tests:
 | `SCStream` without `SCStreamOutput` | UI becomes smooth |
 | Creating `SCStream` without `startCapture()` | UI stutters |
 | `SCStream.startCapture()` | UI becomes smooth |
+| `CGDisplayStream` (CoreGraphics, no replayd) | UI becomes smooth |
+| `CGDisplayStream` zero-rate (min frame time 1e9 s → no frames delivered) | UI stutters |
+| `CGDisplayStream` without `start()` (no capture session) | UI stutters |
 
 The important observation is that **starting the capture session itself appears to
 be sufficient**. The application does not need to consume the captured frames.
 
+A zero-rate `CGDisplayStream` test narrows this further: with
+`minimumFrameTime` set to ~1e9 seconds (session active, but the pipeline is
+asked to never deliver a frame), UI animations **stutter again**.  So an
+active session alone is not enough — the display-capture pipeline must
+actually be **producing frames** at some rate for the effect to kick in,
+even though the app ignores every frame it receives.
+
+The no-`start()` control — stream object created but never started, so no
+capture session exists at all — also stutters, confirming the stream must
+actually be running for the effect to appear.
+
 This suggests that the effect is related to a system-level display/compositor
-state rather than simply increased GPU utilization.
+state rather than simply increased GPU utilization, and that the relevant
+state lives in the WindowServer display-capture/compositor pipeline itself
+(no ScreenCaptureKit, no `replayd` required).
 
 ## Building
 
@@ -69,6 +122,16 @@ state rather than simply increased GPU utilization.
 
 You do **not** need the full Xcode application. The Xcode Command Line Tools
 are sufficient to compile the project.
+
+Two variants are built by the same script.  The default is the
+`CGDisplayStream` build (`main.swift` → `AnimationFix.app`); the
+ScreenCaptureKit build is one argument away (`main-sck.swift` →
+`AnimationFixSck.app`):
+
+```bash
+./build.sh run        # default (CGDisplayStream, no replayd)
+./build.sh sck run    # ScreenCaptureKit (supported fallback)
+```
 
 ### 1. Clone the repository
 
@@ -93,13 +156,14 @@ Useful variants:
 ./build.sh install   # build, install to /Applications, and launch it
 ```
 
-The script is a thin wrapper around `swiftc` (against AppKit,
+The script is a thin wrapper around `swiftc` (the default build links
+AppKit, CoreGraphics, CoreVideo and IOSurface; the SCK build links AppKit,
 ScreenCaptureKit and CoreMedia), bundle assembly, and a minimal
 `Info.plist` with `LSUIElement` — see `build.sh` for the exact steps.
 
 ## Keeping the session alive
 
-`SCStream` sessions are invalidated by the system whenever the display
+Capture sessions are invalidated by the system whenever the display
 environment changes:
 
 - the Mac sleeps or wakes (including closing / opening the lid),
@@ -107,15 +171,17 @@ environment changes:
 - displays are connected or disconnected (e.g. a docking station),
 - a display wakes from display sleep.
 
-AnimationFix now watches for these events and automatically recreates the
+Both variants watch for these events and automatically recreate the
 capture session:
 
 - `NSWorkspace.didWakeNotification` / `screensDidWakeNotification` (sleep/wake)
 - `NSWorkspace.sessionDidBecomeActiveNotification` (unlock)
 - `NSApplication.didChangeScreenParametersNotification` (dock, external displays)
 
-The stream delegate (`SCStreamDelegate.stream(_:didStopWithError:)`) restarts
-the session if the system kills it for any other reason.  Restarts are
+A watchdog restarts the session if the system kills it for any other
+reason — the CG build detects an unexpected `.stopped` status in its frame
+handler, the SCK build implements
+`SCStreamDelegate.stream(_:didStopWithError:)`.  Restarts are
 debounced (dock transitions fire a burst of notifications) and transient
 start failures right after wake are retried automatically.
 
@@ -146,10 +212,12 @@ shows a permission error, re-grant it in System Settings → Privacy & Security
 There are no known security vulnerabilities in this codebase.  The attack
 surface is deliberately minimal and the entire implementation is auditable.
 
-**The app never sees your screen content.**  The `SCStream` is created
-without an `SCStreamOutput`, so captured frames are never delivered to the
-process — they are not buffered, encoded, logged, or stored anywhere.  The
-app's only effect is keeping the capture *session* active.
+**The app never uses your screen content.**  The SCK build creates the
+`SCStream` without an `SCStreamOutput`, so frames are never delivered to the
+process.  The default CG build's frame handler is a no-op that discards
+every IOSurface immediately.  In both builds, frames are not buffered,
+encoded, logged, or stored anywhere.  The app's only effect is keeping the
+capture *session* active.
 
 **No other sensitive access:**
 
@@ -170,19 +238,20 @@ app's only effect is keeping the capture *session* active.
 
 **Transparency:**
 
-- The whole implementation is the single `main.swift` file in this
-  repository.  Build it from source and audit it yourself; do not run
-  prebuilt binaries from untrusted sources.
+- The whole implementation is two Swift files in this repository
+  (`main.swift` — the default build — and `main-sck.swift`).  Build it from
+  source and audit it yourself; do not run prebuilt binaries from
+  untrusted sources.
 - While the stream is active, macOS shows its own screen-recording
   indicator in the menu bar, independently of this app.
 
 **What you should understand:** the app holds Screen Recording permission,
-which is inherent to its purpose — macOS treats starting a `SCStream` as
-screen recording.  As with any recording app, a modified build would have
-access to the screen, and the binary itself is ad-hoc signed and not
-sandboxed.  For the code in this repository that is irrelevant (it does
-nothing but start a capture session), but it is why you should always build
-and run the app from the published source.
+which is inherent to its purpose — macOS treats starting a display-capture
+session (either variant) as screen recording.  As with any recording app, a
+modified build would have access to the screen, and the binary itself is
+ad-hoc signed and not sandboxed.  For the code in this repository that is
+irrelevant (it does nothing but start a capture session), but it is why you
+should always build and run the app from the published source.
 
 ## Important disclaimer
 
@@ -197,10 +266,13 @@ The exact mechanism is currently unknown.
 The project is based on observed behavior:
 
 ```text
-SCStream inactive
+No active display-capture session
     ↓
 UI animations stutter
 
-SCStream.startCapture()
+Display-capture session whose frames are actually flowing
+(`SCStream` via replayd, or `CGDisplayStream` directly)
     ↓
 UI animations become smooth
+```
+
