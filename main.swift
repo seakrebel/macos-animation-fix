@@ -171,7 +171,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
 
         if let button = statusItem.button {
-            button.title = "◉"
             button.toolTip = "AnimationFix"
         }
 
@@ -207,6 +206,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(quitItem)
 
         statusItem.menu = menu
+
+        // Initial icon state (dimmed until the stream is live).
+        updateMenu()
     }
 
     private func updateMenu() {
@@ -219,7 +221,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         enabledItem.state = enabled ? .on : .off
 
         if let button = statusItem.button {
-            button.title = enabled ? "●" : "○"
+            button.image = NSImage(
+                systemSymbolName: enabled
+                    ? "wrench.and.screwdriver.fill"
+                    : "wrench.and.screwdriver",
+                accessibilityDescription: enabled
+                    ? "AnimationFix active"
+                    : "AnimationFix paused"
+            )
+            button.image?.isTemplate = true
+            button.contentTintColor = enabled
+                ? .controlAccentColor
+                : .tertiaryLabelColor
         }
     }
 
