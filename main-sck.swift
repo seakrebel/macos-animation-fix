@@ -176,7 +176,6 @@ final class AppDelegate: NSObject,
         )
 
         if let button = statusItem.button {
-            button.title = "◉"
             button.toolTip = "AnimationFixSck"
         }
 
@@ -212,6 +211,9 @@ final class AppDelegate: NSObject,
         menu.addItem(quitItem)
 
         statusItem.menu = menu
+
+        // Initial icon state (dimmed until the stream is live).
+        updateMenu()
     }
 
     private func updateMenu() {
@@ -224,7 +226,18 @@ final class AppDelegate: NSObject,
         enabledItem.state = enabled ? .on : .off
 
         if let button = statusItem.button {
-            button.title = enabled ? "●" : "○"
+            button.image = NSImage(
+                systemSymbolName: enabled
+                    ? "wrench.and.screwdriver.fill"
+                    : "wrench.and.screwdriver",
+                accessibilityDescription: enabled
+                    ? "AnimationFixSck active"
+                    : "AnimationFixSck paused"
+            )
+            button.image?.isTemplate = true
+            button.contentTintColor = enabled
+                ? .controlAccentColor
+                : .tertiaryLabelColor
         }
     }
 
