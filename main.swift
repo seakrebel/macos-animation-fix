@@ -230,9 +230,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     : "AnimationFix paused"
             )
             button.image?.isTemplate = true
-            button.contentTintColor = enabled
-                ? .controlAccentColor
-                : .tertiaryLabelColor
+            button.alphaValue = enabled ? 1.0 : 0.5
         }
     }
 

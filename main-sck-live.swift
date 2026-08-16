@@ -334,9 +334,7 @@ final class AppDelegate: NSObject,
                     : "AnimationFixSckLive paused"
             )
             button.image?.isTemplate = true
-            button.contentTintColor = enabled
-                ? .controlAccentColor
-                : .tertiaryLabelColor
+            button.alphaValue = enabled ? 1.0 : 0.5
         }
     }
 
