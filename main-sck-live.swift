@@ -326,9 +326,7 @@ final class AppDelegate: NSObject,
 
         if let button = statusItem.button {
             button.image = NSImage(
-                systemSymbolName: enabled
-                    ? "wrench.and.screwdriver.fill"
-                    : "wrench.and.screwdriver",
+                systemSymbolName: "wrench.fill",
                 accessibilityDescription: enabled
                     ? "AnimationFixSckLive active"
                     : "AnimationFixSckLive paused"
